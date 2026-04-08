@@ -28,6 +28,7 @@ The ServerSession class is typically used internally by the Server class and sho
 be instantiated directly by users of the MCP framework.
 """
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, TypeVar, overload
 
@@ -203,6 +204,43 @@ class ServerSession(
             case _:
                 if self._initialization_state != InitializationState.Initialized:  # pragma: no cover
                     raise RuntimeError("Received notification before initialization was complete")
+
+    async def emit_event(
+        self,
+        topic: str,
+        payload: Any,
+        *,
+        event_id: str | None = None,
+        timestamp: str | None = None,
+        retained: bool = False,
+        source: str | None = None,
+        correlation_id: str | None = None,
+        requested_effects: list[types.EventEffect] | None = None,
+        expires_at: str | None = None,
+        related_request_id: types.RequestId | None = None,
+    ) -> None:
+        """Push an event to the client on the given topic."""
+        timestamp = timestamp or datetime.now(timezone.utc).isoformat()
+        if event_id is None:
+            from ulid import ULID
+
+            event_id = str(ULID())
+        await self.send_notification(
+            types.EventEmitNotification(
+                params=types.EventParams(
+                    topic=topic,
+                    event_id=event_id,
+                    payload=payload,
+                    timestamp=timestamp,
+                    retained=retained,
+                    source=source,
+                    correlation_id=correlation_id,
+                    requested_effects=requested_effects,
+                    expires_at=expires_at,
+                ),
+            ),
+            related_request_id,
+        )
 
     async def send_log_message(
         self,

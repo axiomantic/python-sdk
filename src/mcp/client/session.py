@@ -43,6 +43,10 @@ class ListRootsFnT(Protocol):
     ) -> types.ListRootsResult | types.ErrorData: ...  # pragma: no branch
 
 
+class EventHandlerFnT(Protocol):
+    async def __call__(self, params: types.EventParams) -> None: ...  # pragma: no branch
+
+
 class LoggingFnT(Protocol):
     async def __call__(self, params: types.LoggingMessageNotificationParams) -> None: ...  # pragma: no branch
 
@@ -133,6 +137,9 @@ class ClientSession(
         self._tool_output_schemas: dict[str, dict[str, Any] | None] = {}
         self._initialize_result: types.InitializeResult | None = None
         self._experimental_features: ExperimentalClientFeatures | None = None
+        self._event_handler: EventHandlerFnT | None = None
+        self._event_topic_filter: str | None = None
+        self._subscribed_patterns: set[str] = set()
 
         # Experimental: Task handlers (use defaults if not provided)
         self._task_handlers = experimental_task_handlers or ExperimentalTaskHandlers()
@@ -188,6 +195,22 @@ class ClientSession(
         self._initialize_result = result
 
         await self.send_notification(types.InitializedNotification())
+
+        # Auto-subscribe to session-specific events if the server declares
+        # events capability and provides a session_id in the init result.
+        # TODO: InitializeResult does not yet include a session_id field.
+        # Once the server-side protocol adds session_id to the initialization
+        # result, replace the getattr fallback with a proper field access.
+        if result.capabilities.events is not None:
+            session_id = getattr(result, "session_id", None)
+            if session_id is not None:
+                try:
+                    await self.subscribe_events([f"$sessions/{session_id}/#"])
+                except Exception:
+                    logger.debug(
+                        "Failed to auto-subscribe to session topic $sessions/%s/#",
+                        session_id,
+                    )
 
         return result
 
@@ -412,6 +435,95 @@ class ClientSession(
         """Send a roots/list_changed notification."""
         await self.send_notification(types.RootsListChangedNotification())
 
+    async def subscribe_events(self, topics: list[str]) -> types.EventSubscribeResult:
+        """Send an events/subscribe request."""
+        result = await self.send_request(
+            types.EventSubscribeRequest(
+                params=types.EventSubscribeParams(topics=topics),
+            ),
+            types.EventSubscribeResult,
+        )
+        # Track successfully subscribed patterns for client-side filtering
+        for sub in result.subscribed:
+            self._subscribed_patterns.add(sub.pattern)
+        return result
+
+    async def unsubscribe_events(self, topics: list[str]) -> types.EventUnsubscribeResult:
+        """Send an events/unsubscribe request."""
+        result = await self.send_request(
+            types.EventUnsubscribeRequest(
+                params=types.EventUnsubscribeParams(topics=topics),
+            ),
+            types.EventUnsubscribeResult,
+        )
+        # Remove from client-side tracking
+        for pattern in result.unsubscribed:
+            self._subscribed_patterns.discard(pattern)
+        return result
+
+    async def list_events(self) -> types.EventListResult:
+        """Send an events/list request."""
+        return await self.send_request(
+            types.EventListRequest(),
+            types.EventListResult,
+        )
+
+    def set_event_handler(
+        self,
+        handler: EventHandlerFnT,
+        *,
+        topic_filter: str | None = None,
+    ) -> None:
+        """Register a callback for incoming event notifications.
+
+        Args:
+            handler: Async callable invoked for each matching event.
+            topic_filter: Optional MQTT-style pattern to pre-filter events
+                client-side. If ``None``, all events are forwarded.
+        """
+        self._event_handler = handler
+        self._event_topic_filter = topic_filter
+
+    def on_event(self, topic_filter: str | None = None):
+        """Decorator for registering an event handler.
+
+        Usage::
+
+            @session.on_event("spellbook/sessions/+/messages")
+            async def handle_message(params: types.EventParams):
+                print(params.payload)
+        """
+
+        def decorator(fn: EventHandlerFnT) -> EventHandlerFnT:
+            self.set_event_handler(fn, topic_filter=topic_filter)
+            return fn
+
+        return decorator
+
+    def _topic_matches_subscriptions(self, topic: str) -> bool:
+        """Check if a topic matches any of our subscribed patterns (defense in depth)."""
+        import re as _re
+
+        for pattern in self._subscribed_patterns:
+            parts = pattern.split("/")
+            regex_parts: list[str] = []
+            for i, part in enumerate(parts):
+                if part == "#":
+                    # (/.*)?$ so # matches zero or more trailing segments
+                    regex = "^" + "/".join(regex_parts) + "(/.*)?$"
+                    if _re.match(regex, topic):
+                        return True
+                    break
+                elif part == "+":
+                    regex_parts.append("[^/]+")
+                else:
+                    regex_parts.append(_re.escape(part))
+            else:
+                regex = "^" + "/".join(regex_parts) + "$"
+                if _re.match(regex, topic):
+                    return True
+        return False
+
     async def _received_request(self, responder: RequestResponder[types.ServerRequest, types.ClientResult]) -> None:
         ctx = RequestContext[ClientSession](request_id=responder.request_id, meta=responder.request_meta, session=self)
 
@@ -476,5 +588,41 @@ class ClientSession(
                 # Clients MAY use this to retry requests or update UI
                 # The notification contains the elicitationId of the completed elicitation
                 pass
+            case types.EventEmitNotification(params=params):
+                await self._handle_event(params)
             case _:
                 pass
+
+    async def _handle_event(self, params: types.EventParams) -> None:
+        """Dispatch an incoming event to the registered handler."""
+        if self._event_handler is None:
+            return
+
+        # Client-side subscription tracking: drop events for unsubscribed topics
+        if self._subscribed_patterns and not self._topic_matches_subscriptions(params.topic):
+            return
+
+        # Apply optional topic filter
+        if self._event_topic_filter is not None:
+            import re as _re
+
+            parts = self._event_topic_filter.split("/")
+            regex_parts: list[str] = []
+            matched = False
+            for i, part in enumerate(parts):
+                if part == "#":
+                    # (/.*)?$ so # matches zero or more trailing segments
+                    regex = "^" + "/".join(regex_parts) + "(/.*)?$"
+                    matched = bool(_re.match(regex, params.topic))
+                    break
+                elif part == "+":
+                    regex_parts.append("[^/]+")
+                else:
+                    regex_parts.append(_re.escape(part))
+            else:
+                regex = "^" + "/".join(regex_parts) + "$"
+                matched = bool(_re.match(regex, params.topic))
+            if not matched:
+                return
+
+        await self._event_handler(params)

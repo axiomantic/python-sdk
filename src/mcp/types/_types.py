@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from collections.abc import Callable
 from typing import Annotated, Any, Final, Generic, Literal, TypeAlias, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, FileUrl, TypeAdapter
@@ -43,6 +44,7 @@ class MCPModel(BaseModel):
 
 
 Meta: TypeAlias = dict[str, Any]
+AnyFunction: TypeAlias = Callable[..., Any]
 
 
 class RequestParamsMeta(TypedDict, extra_items=Any):
@@ -403,6 +405,32 @@ class ServerCapabilities(MCPModel):
 
     tasks: ServerTasksCapability | None = None
     """Present if the server supports task-augmented requests."""
+
+    events: EventsCapability | None = None
+    """Present if the server supports publishing events to clients."""
+
+
+class EventEffect(MCPModel):
+    """Advisory hint about how the client should handle an event."""
+
+    type: Literal["inject_context", "notify_user", "trigger_turn"]
+    priority: Literal["low", "normal", "high", "urgent"] = "normal"
+
+
+class EventTopicDescriptor(MCPModel):
+    """Describes a topic the server can publish to."""
+
+    pattern: str
+    description: str | None = None
+    retained: bool = False
+    schema_: dict[str, Any] | None = Field(None, alias="schema")
+
+
+class EventsCapability(MCPModel):
+    """Server capability for events."""
+
+    topics: list[EventTopicDescriptor] = []
+    instructions: str | None = None
 
 
 TaskStatus = Literal["working", "input_required", "completed", "failed", "cancelled"]
@@ -1251,6 +1279,113 @@ class LoggingMessageNotification(Notification[LoggingMessageNotificationParams, 
     params: LoggingMessageNotificationParams
 
 
+class EventParams(NotificationParams):
+    """Parameters for events/emit notification.
+
+    Extends NotificationParams (not MCPModel) because the Notification generic
+    requires NotificationParamsT which is bound to NotificationParams.
+    This gives us the _meta field for related_request_id tracking.
+    """
+
+    topic: str
+    event_id: str
+    payload: Any
+    timestamp: str | None = None
+    retained: bool = False
+    source: str | None = None
+    correlation_id: str | None = None
+    requested_effects: list[EventEffect] | None = None
+    expires_at: str | None = None
+
+
+class EventEmitNotification(Notification[EventParams, Literal["events/emit"]]):
+    """Event notification sent from server to client.
+
+    NOTE: We use "events/emit" rather than "notifications/events/emit" intentionally.
+    Events are a new primitive distinct from notifications. The "events/" prefix
+    deliberately breaks the "notifications/" convention because events need
+    permission checking and subscription management.
+    """
+
+    method: Literal["events/emit"] = "events/emit"
+    params: EventParams
+
+
+class EventSubscribeParams(RequestParams):
+    """Parameters for events/subscribe request."""
+
+    topics: list[str]
+
+
+class SubscribedTopic(MCPModel):
+    """A topic pattern that was successfully subscribed."""
+
+    pattern: str
+
+
+class RejectedTopic(MCPModel):
+    """A topic pattern that was rejected, with reason."""
+
+    pattern: str
+    reason: str  # e.g. "unknown_topic", "rate_limited", "permission_denied", "invalid_pattern"
+
+
+class RetainedEvent(MCPModel):
+    """A retained event delivered on subscribe."""
+
+    topic: str
+    event_id: str
+    timestamp: str | None = None
+    payload: Any
+
+
+class EventSubscribeResult(Result):
+    """Response to events/subscribe."""
+
+    subscribed: list[SubscribedTopic]
+    rejected: list[RejectedTopic] = []
+    retained: list[RetainedEvent] = []
+
+
+class EventSubscribeRequest(Request[EventSubscribeParams, Literal["events/subscribe"]]):
+    """Client request to subscribe to event topics."""
+
+    method: Literal["events/subscribe"] = "events/subscribe"
+    params: EventSubscribeParams
+
+
+class EventUnsubscribeParams(RequestParams):
+    """Parameters for events/unsubscribe request."""
+
+    topics: list[str]
+
+
+class EventUnsubscribeResult(Result):
+    """Response to events/unsubscribe."""
+
+    unsubscribed: list[str]
+
+
+class EventUnsubscribeRequest(Request[EventUnsubscribeParams, Literal["events/unsubscribe"]]):
+    """Client request to unsubscribe from event topics."""
+
+    method: Literal["events/unsubscribe"] = "events/unsubscribe"
+    params: EventUnsubscribeParams
+
+
+class EventListResult(Result):
+    """Response to events/list."""
+
+    topics: list[EventTopicDescriptor]
+
+
+class EventListRequest(Request[RequestParams | None, Literal["events/list"]]):
+    """Client request to list available event topics."""
+
+    method: Literal["events/list"] = "events/list"
+    params: RequestParams | None = None
+
+
 IncludeContext = Literal["none", "thisServer", "allServers"]
 
 
@@ -1611,6 +1746,9 @@ ClientRequest = (
     | GetTaskPayloadRequest
     | ListTasksRequest
     | CancelTaskRequest
+    | EventSubscribeRequest
+    | EventUnsubscribeRequest
+    | EventListRequest
 )
 client_request_adapter = TypeAdapter[ClientRequest](ClientRequest)
 
@@ -1754,6 +1892,7 @@ ServerNotification = (
     | PromptListChangedNotification
     | ElicitCompleteNotification
     | TaskStatusNotification
+    | EventEmitNotification
 )
 server_notification_adapter = TypeAdapter[ServerNotification](ServerNotification)
 
@@ -1774,5 +1913,8 @@ ServerResult = (
     | ListTasksResult
     | CancelTaskResult
     | CreateTaskResult
+    | EventSubscribeResult
+    | EventUnsubscribeResult
+    | EventListResult
 )
 server_result_adapter = TypeAdapter[ServerResult](ServerResult)

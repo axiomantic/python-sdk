@@ -5,6 +5,9 @@ from .client.stdio import StdioServerParameters, stdio_client
 from .server.session import ServerSession
 from .server.stdio import stdio_server
 from .shared.exceptions import MCPError, UrlElicitationRequiredError
+
+# Backwards compatibility alias (renamed in #1956)
+McpError = MCPError
 from .types import (
     CallToolRequest,
     ClientCapabilities,
@@ -97,6 +100,7 @@ __all__ = [
     "LoggingLevel",
     "LoggingMessageNotification",
     "MCPError",
+    "McpError",
     "Notification",
     "PingRequest",
     "ProgressNotification",

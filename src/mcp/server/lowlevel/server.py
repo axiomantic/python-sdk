@@ -76,6 +76,13 @@ logger = logging.getLogger(__name__)
 
 LifespanResultT = TypeVar("LifespanResultT", default=Any)
 
+# Backwards compatibility: request_ctx was removed in #2203 but downstream
+# packages (e.g. fastmcp) still import it.  Re-export as a deprecated shim.
+request_ctx: contextvars.ContextVar[ServerRequestContext[Any]] = contextvars.ContextVar("request_ctx")
+
+# Backwards compatibility: RequestT moved to mcp.server.context in #2203.
+from mcp.server.context import RequestT as RequestT  # noqa: E402,F811
+
 
 class NotificationOptions:
     def __init__(self, prompts_changed: bool = False, resources_changed: bool = False, tools_changed: bool = False):
@@ -98,7 +105,7 @@ async def _ping_handler(ctx: ServerRequestContext[Any], params: types.RequestPar
     return types.EmptyResult()
 
 
-class Server(Generic[LifespanResultT]):
+class Server(Generic[LifespanResultT, RequestT]):
     def __init__(
         self,
         name: str,
@@ -184,6 +191,22 @@ class Server(Generic[LifespanResultT]):
             Awaitable[None],
         ]
         | None = None,
+        # Event handlers
+        on_subscribe_events: Callable[
+            [ServerRequestContext[LifespanResultT], types.EventSubscribeParams],
+            Awaitable[types.EventSubscribeResult],
+        ]
+        | None = None,
+        on_unsubscribe_events: Callable[
+            [ServerRequestContext[LifespanResultT], types.EventUnsubscribeParams],
+            Awaitable[types.EventUnsubscribeResult],
+        ]
+        | None = None,
+        on_list_events: Callable[
+            [ServerRequestContext[LifespanResultT], types.RequestParams | None],
+            Awaitable[types.EventListResult],
+        ]
+        | None = None,
     ):
         self.name = name
         self.version = version
@@ -218,6 +241,9 @@ class Server(Generic[LifespanResultT]):
                     "tools/call": on_call_tool,
                     "logging/setLevel": on_set_logging_level,
                     "completion/complete": on_completion,
+                    "events/subscribe": on_subscribe_events,
+                    "events/unsubscribe": on_unsubscribe_events,
+                    "events/list": on_list_events,
                 }.items()
                 if handler is not None
             }
@@ -315,6 +341,11 @@ class Server(Generic[LifespanResultT]):
         if "completion/complete" in self._request_handlers:
             completions_capability = types.CompletionsCapability()
 
+        # Set events capability if handler exists
+        events_capability = None
+        if "events/subscribe" in self._request_handlers:
+            events_capability = types.EventsCapability()
+
         capabilities = types.ServerCapabilities(
             prompts=prompts_capability,
             resources=resources_capability,
@@ -322,6 +353,7 @@ class Server(Generic[LifespanResultT]):
             logging=logging_capability,
             experimental=experimental_capabilities,
             completions=completions_capability,
+            events=events_capability,
         )
         if self._experimental_handlers:
             self._experimental_handlers.update_capabilities(capabilities)
@@ -497,7 +529,13 @@ class Server(Generic[LifespanResultT]):
                         close_sse_stream=close_sse_stream_cb,
                         close_standalone_sse_stream=close_standalone_sse_stream_cb,
                     )
-                    response = await handler(ctx, req.params)
+                    # Set the deprecated request_ctx ContextVar for
+                    # backwards compatibility with downstream consumers.
+                    _token = request_ctx.set(ctx)
+                    try:
+                        response = await handler(ctx, req.params)
+                    finally:
+                        request_ctx.reset(_token)
                 except MCPError as err:
                     response = err.error
                 except anyio.get_cancelled_exc_class():
