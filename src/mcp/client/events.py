@@ -58,9 +58,7 @@ class ProvenanceEnvelope:
         """
         from xml.sax.saxutils import escape, quoteattr  # noqa: PLC0415
 
-        attrs = " ".join(
-            f"{k}={quoteattr(str(v))}" for k, v in self.to_dict().items()
-        )
+        attrs = " ".join(f"{k}={quoteattr(str(v))}" for k, v in self.to_dict().items())
         return f"<mcp:event {attrs}>{escape(payload_text)}</mcp:event>"
 
     @classmethod
@@ -103,9 +101,7 @@ class EventQueue:
     }
 
     def __init__(self) -> None:
-        self._queues: dict[str, deque[EventParams]] = {
-            p: deque() for p in self._PRIORITY_ORDER
-        }
+        self._queues: dict[str, deque[EventParams]] = {p: deque() for p in self._PRIORITY_ORDER}
 
     def enqueue(self, event: EventParams) -> None:
         """Add an event to the appropriate priority queue.

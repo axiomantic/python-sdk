@@ -7,7 +7,6 @@ from datetime import datetime
 from mcp.client.events import EventQueue, ProvenanceEnvelope
 from mcp.types import EventEffect, EventParams
 
-
 # ---------------------------------------------------------------------------
 # ProvenanceEnvelope
 # ---------------------------------------------------------------------------
@@ -68,16 +67,12 @@ class TestProvenanceEnvelope:
         assert "received_at" not in xml
 
     def test_to_xml_empty_payload(self) -> None:
-        env = ProvenanceEnvelope(
-            server="s", server_trust="t", topic="x"
-        )
+        env = ProvenanceEnvelope(server="s", server_trust="t", topic="x")
         xml = env.to_xml()
         assert xml.endswith("></mcp:event>")
 
     def test_to_xml_with_special_chars_in_payload(self) -> None:
-        env = ProvenanceEnvelope(
-            server="s", server_trust="t", topic="x"
-        )
+        env = ProvenanceEnvelope(server="s", server_trust="t", topic="x")
         xml = env.to_xml('<script>alert("xss")</script>')
         # Payload body must be escaped
         assert "<script>" not in xml
@@ -94,7 +89,7 @@ class TestProvenanceEnvelope:
         assert "server='evil\"server'" in xml
         # quoteattr escapes < inside attribute values
         assert 'topic="x&lt;y"' in xml
-        assert xml == "<mcp:event server='evil\"server' server_trust=\"t\" topic=\"x&lt;y\">payload</mcp:event>"
+        assert xml == '<mcp:event server=\'evil"server\' server_trust="t" topic="x&lt;y">payload</mcp:event>'
 
     def test_from_event_extracts_fields(self) -> None:
         event = EventParams(
@@ -103,9 +98,7 @@ class TestProvenanceEnvelope:
             payload={"status": "ok"},
             source="ci/jenkins",
         )
-        env = ProvenanceEnvelope.from_event(
-            event, server="ci-server", server_trust="configured"
-        )
+        env = ProvenanceEnvelope.from_event(event, server="ci-server", server_trust="configured")
         assert env.server == "ci-server"
         assert env.server_trust == "configured"
         assert env.topic == "builds/status"
@@ -121,9 +114,7 @@ class TestProvenanceEnvelope:
             eventId="evt_456",
             payload={},
         )
-        env = ProvenanceEnvelope.from_event(
-            event, server="srv", server_trust="unknown"
-        )
+        env = ProvenanceEnvelope.from_event(event, server="srv", server_trust="unknown")
         assert env.source is None
 
 
@@ -205,10 +196,13 @@ class TestEventQueue:
 
     def test_priority_from_multiple_effects(self) -> None:
         q = EventQueue()
-        event = _make_event(topic="multi-effect", effects=[
-            EventEffect(type="inject_context", priority="low"),
-            EventEffect(type="notify_user", priority="urgent"),
-        ])
+        event = _make_event(
+            topic="multi-effect",
+            effects=[
+                EventEffect(type="inject_context", priority="low"),
+                EventEffect(type="notify_user", priority="urgent"),
+            ],
+        )
         low_event = _make_event(topic="low-only", effects=[EventEffect(type="inject_context", priority="low")])
         q.enqueue(event)
         q.enqueue(low_event)

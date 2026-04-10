@@ -29,7 +29,7 @@ Topics are `/`-separated strings with a maximum depth of 8 segments. Clients sub
 
 ### Session-Scoped Topics
 
-Servers may use a `{session_id}` placeholder in topic patterns to scope topics to individual sessions (e.g., `app/sessions/{session_id}/messages`). When a topic contains `{session_id}`, the server enforces that subscribers can only substitute their own session UUID -- wildcards and other session IDs are rejected. This convention is not part of the core MCP spec but is a common server-side pattern (used by FastMCP, among others).
+Servers may use a `{session_id}` placeholder in topic patterns to scope topics to individual sessions (e.g., `app/sessions/{session_id}/messages`). When a topic contains `{session_id}`, the server enforces that subscribers can only substitute their own session UUID -- wildcards and other session IDs are rejected. Sessions use `{session_id}` to receive topics scoped to themselves -- useful for targeted notifications, status updates, task assignments, or any application-level filtering that should be per-session. This convention is not part of the core MCP spec but is a common server-side pattern (used by FastMCP, among others).
 
 ## Server-Side
 
@@ -206,6 +206,15 @@ After initialization, `session.session_id` returns the server-assigned session I
 ```python
 topic = f"app/sessions/{session.session_id}/messages"
 await session.subscribe_events([topic])
+```
+
+Session-scoped topics work for any per-session delivery pattern:
+
+```python
+# Non-messaging examples of session-scoped topics:
+build_topic = f"app/sessions/{session.session_id}/builds"
+task_topic = f"app/sessions/{session.session_id}/tasks"
+alerts_topic = f"app/sessions/{session.session_id}/alerts"
 ```
 
 Returns `None` if the server does not provide a session ID in `_meta`.
