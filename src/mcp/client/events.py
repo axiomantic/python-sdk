@@ -31,35 +31,46 @@ class ProvenanceEnvelope:
     event_id: str | None = None
     received_at: str | None = None  # ISO 8601, client-stamped
 
+    priority: str = "normal"
+    correlation_id: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to dict, omitting None values."""
+        """Serialize to dict for XML attributes, omitting None values.
+
+        Uses standardized attribute names per MCP Events spec:
+        ``trust`` (not ``server_trust``) for the client-assessed trust tier.
+        """
         d: dict[str, Any] = {
             "server": self.server,
-            "server_trust": self.server_trust,
             "topic": self.topic,
+            "priority": self.priority,
         }
-        if self.source is not None:
-            d["source"] = self.source
         if self.event_id is not None:
             d["event_id"] = self.event_id
-        if self.received_at is not None:
-            d["received_at"] = self.received_at
+        d["trust"] = self.server_trust
+        if self.source is not None:
+            d["source"] = self.source
+        if self.correlation_id is not None:
+            d["correlation_id"] = self.correlation_id
         return d
 
     def to_xml(self, payload_text: str = "") -> str:
         """Format as XML element for LLM context injection.
 
-        Args:
-            payload_text: The event payload as a string (JSON or otherwise).
-                          Inserted as the element body.
+        Produces the normative XML format per MCP Events spec::
 
-        Note: All attribute values are XML-escaped via quoteattr to prevent
+            <mcp:event server="NAME" topic="TOPIC" priority="PRIORITY"
+                       event_id="ID" trust="LEVEL" source="SRC">
+            ESCAPED_PAYLOAD
+            </mcp:event>
+
+        All attribute values are XML-escaped via quoteattr to prevent
         injection from attacker-controlled field values.
         """
         from xml.sax.saxutils import escape, quoteattr  # noqa: PLC0415
 
         attrs = " ".join(f"{k}={quoteattr(str(v))}" for k, v in self.to_dict().items())
-        return f"<mcp:event {attrs}>{escape(payload_text)}</mcp:event>"
+        return f"<mcp:event {attrs}>\n{escape(payload_text)}\n</mcp:event>"
 
     @classmethod
     def from_event(
@@ -76,6 +87,15 @@ class ProvenanceEnvelope:
         """
         from datetime import datetime, timezone  # noqa: PLC0415
 
+        priority = "normal"
+        if event.requestedEffects:
+            priority_order = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+            best = min(
+                (e.priority for e in event.requestedEffects),
+                key=lambda p: priority_order.get(p, 2),
+            )
+            priority = best
+
         return cls(
             server=server,
             server_trust=server_trust,
@@ -83,6 +103,8 @@ class ProvenanceEnvelope:
             source=event.source,
             event_id=event.eventId,
             received_at=datetime.now(timezone.utc).isoformat(),
+            priority=priority,
+            correlation_id=event.correlationId,
         )
 
 
