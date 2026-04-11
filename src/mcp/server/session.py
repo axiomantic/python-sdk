@@ -38,7 +38,7 @@ be instantiated directly by users of the MCP framework.
 """
 
 from enum import Enum
-from typing import Any, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import anyio
 import anyio.lowlevel
@@ -206,24 +206,23 @@ class ServerSession(
     async def emit_event(
         self,
         topic: str,
-        payload: Any,
+        payload: Any = None,
         *,
         event_id: str | None = None,
-        timestamp: str | None = None,
+        priority: Literal["urgent", "high", "normal", "low"] | None = None,
         retained: bool = False,
         source: str | None = None,
-        correlation_id: str | None = None,
-        requested_effects: list[types.EventEffect] | None = None,
         expires_at: str | None = None,
         related_request_id: types.RequestId | None = None,
     ) -> None:
-        """Push an event to the client on the given topic."""
+        """Push an event to the client on the given topic.
+
+        Aligned with MCP Events Spec v2: priority is the only server hint;
+        there is no ``correlation_id``/``requested_effects``/``timestamp``.
+        Clients decide handling via their own configuration.
+        """
         if event_id is None:
             event_id = str(ULID())
-        if timestamp is None:
-            from datetime import datetime, timezone
-
-            timestamp = datetime.now(timezone.utc).isoformat()
         await self.send_notification(
             types.ServerNotification(
                 types.EventEmitNotification(
@@ -231,11 +230,9 @@ class ServerSession(
                         topic=topic,
                         eventId=event_id,
                         payload=payload,
-                        timestamp=timestamp,
+                        priority=priority,
                         retained=retained,
                         source=source,
-                        correlationId=correlation_id,
-                        requestedEffects=requested_effects,
                         expiresAt=expires_at,
                     ),
                 )

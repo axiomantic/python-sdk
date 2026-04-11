@@ -20,8 +20,11 @@ __all__ = ["EventQueue", "ProvenanceEnvelope"]
 class ProvenanceEnvelope:
     """Client-side provenance wrapper for events injected into LLM context.
 
-    Clients generate this locally when honoring inject_context effects.
-    The server_trust field MUST be client-assessed, never server-supplied.
+    Clients generate this locally when formatting events for the LLM.
+    The ``server_trust`` field MUST be client-assessed, never server-supplied.
+
+    XML attribute order is normative per MCP Events Spec v2:
+    ``server, topic, priority, event_id, trust, source``.
     """
 
     server: str
@@ -32,13 +35,14 @@ class ProvenanceEnvelope:
     received_at: str | None = None  # ISO 8601, client-stamped
 
     priority: str = "normal"
-    correlation_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dict for XML attributes, omitting None values.
 
-        Uses standardized attribute names per MCP Events spec:
-        ``trust`` (not ``server_trust``) for the client-assessed trust tier.
+        Attribute order matches the spec v2 normative order:
+        ``server, topic, priority, event_id, trust, source``. The
+        ``trust`` attribute is always emitted (server_trust is a
+        REQUIRED client-assessed field).
         """
         d: dict[str, Any] = {
             "server": self.server,
@@ -50,14 +54,12 @@ class ProvenanceEnvelope:
         d["trust"] = self.server_trust
         if self.source is not None:
             d["source"] = self.source
-        if self.correlation_id is not None:
-            d["correlation_id"] = self.correlation_id
         return d
 
     def to_xml(self, payload_text: str = "") -> str:
         """Format as XML element for LLM context injection.
 
-        Produces the normative XML format per MCP Events spec::
+        Produces the normative XML format per MCP Events Spec v2::
 
             <mcp:event server="NAME" topic="TOPIC" priority="PRIORITY"
                        event_id="ID" trust="LEVEL" source="SRC">
@@ -82,19 +84,11 @@ class ProvenanceEnvelope:
     ) -> ProvenanceEnvelope:
         """Create an envelope from an EventParams notification.
 
-        Extracts topic, source, and event_id from the event and stamps
-        received_at with the current UTC time.
+        Extracts topic, source, event_id, and priority from the event and
+        stamps ``received_at`` with the current UTC time. Events without an
+        explicit ``priority`` default to ``"normal"``.
         """
         from datetime import datetime, timezone  # noqa: PLC0415
-
-        priority = "normal"
-        if event.requestedEffects:
-            priority_order = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
-            best = min(
-                (e.priority for e in event.requestedEffects),
-                key=lambda p: priority_order.get(p, 2),
-            )
-            priority = best
 
         return cls(
             server=server,
@@ -103,16 +97,16 @@ class ProvenanceEnvelope:
             source=event.source,
             event_id=event.eventId,
             received_at=datetime.now(timezone.utc).isoformat(),
-            priority=priority,
-            correlation_id=event.correlationId,
+            priority=event.priority or "normal",
         )
 
 
 class EventQueue:
     """Priority-aware event buffer for client-side processing.
 
-    Events are enqueued with a priority derived from their requested_effects.
+    Events are enqueued at the priority declared on ``EventParams.priority``.
     drain() returns events in priority order (urgent > high > normal > low).
+    Events with no explicit priority are treated as ``"normal"``.
     """
 
     _PRIORITY_ORDER: ClassVar[dict[str, int]] = {
@@ -128,8 +122,8 @@ class EventQueue:
     def enqueue(self, event: EventParams) -> None:
         """Add an event to the appropriate priority queue.
 
-        Priority is derived from the highest-priority requested_effect.
-        Events with no requested_effects default to "normal".
+        Priority is read directly from ``EventParams.priority``. Events
+        without a priority default to ``"normal"``.
         """
         priority = self._resolve_priority(event)
         self._queues[priority].append(event)
@@ -159,14 +153,8 @@ class EventQueue:
         return any(self._queues.values())
 
     def _resolve_priority(self, event: EventParams) -> str:
-        """Determine priority from highest-priority requested_effect."""
-        if not event.requestedEffects:
+        """Determine priority from the event's ``priority`` field."""
+        priority = event.priority
+        if priority is None or priority not in self._PRIORITY_ORDER:
             return "normal"
-        best = "low"
-        best_rank = self._PRIORITY_ORDER["low"]
-        for effect in event.requestedEffects:
-            rank = self._PRIORITY_ORDER.get(effect.priority, best_rank)
-            if rank < best_rank:
-                best = effect.priority
-                best_rank = rank
-        return best
+        return priority

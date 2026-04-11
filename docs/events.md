@@ -27,9 +27,9 @@ Topics are `/`-separated strings with a maximum depth of 8 segments. Clients sub
 - `+` matches exactly one segment
 - `#` matches zero or more trailing segments (must be the last segment)
 
-### Session-Scoped Topics
+### Agent-Scoped Topics
 
-Servers may use a `{session_id}` placeholder in topic patterns to scope topics to individual sessions (e.g., `app/sessions/{session_id}/messages`). When a topic contains `{session_id}`, the server enforces that subscribers can only substitute their own session UUID -- wildcards and other session IDs are rejected. Sessions use `{session_id}` to receive topics scoped to themselves -- useful for targeted notifications, status updates, task assignments, or any application-level filtering that should be per-session. This convention is not part of the core MCP spec but is a common server-side pattern (used by FastMCP, among others).
+Servers may use an `{agent_id}` placeholder in topic patterns to scope topics to individual application-level agents (e.g., `agents/{agent_id}/messages`). `{agent_id}` is a client-side concept: the server receives fully resolved topic strings after the client substitutes its own agent IDs. When a topic contains `{agent_id}`, the server enforces that subscribers can only substitute their own agent ID -- wildcards and other agent IDs are rejected. Agents use `{agent_id}` to receive topics scoped to themselves -- useful for targeted notifications, status updates, task assignments, or any application-level filtering that should be per-agent. This convention is normative per MCP Events Spec v2; `{agent_id}` is distinct from the MCP transport session ID, which is NOT exposed in topic patterns.
 
 ## Server-Side
 
@@ -53,38 +53,29 @@ await server_session.emit_event(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `topic` | `str` | (required) | Topic string to publish on |
-| `payload` | `Any` | (required) | Event data (any JSON-serializable value) |
+| `payload` | `Any \| None` | `None` | Event data (any JSON-serializable value, or `None` for signal events) |
 | `event_id` | `str \| None` | auto-generated ULID | Unique event identifier |
-| `timestamp` | `str \| None` | current UTC ISO 8601 | Event timestamp |
+| `priority` | `Literal["urgent","high","normal","low"] \| None` | `None` | Server hint for event urgency; clients default to `"normal"` when absent |
 | `retained` | `bool` | `False` | Whether to treat as a retained value |
 | `source` | `str \| None` | `None` | Opaque source identifier |
-| `correlation_id` | `str \| None` | `None` | Links related events together |
-| `requested_effects` | `list[EventEffect] \| None` | `None` | Advisory hints for client behavior |
 | `expires_at` | `str \| None` | `None` | ISO 8601 expiry for retained values |
 
-### Requested Effects
+### Priority
 
-`EventEffect` provides advisory hints about how the client should handle an event:
+`priority` is the only server-side hint in MCP Events Spec v2. It declares
+how urgent the event is; the client decides how to handle it (drop, silent,
+notify, ask, inject, interrupt) based on its own configuration and the
+topic's `suggestedHandle`.
 
 ```python
-from mcp.types import EventEffect
-
 await server_session.emit_event(
     topic="alert/critical",
     payload={"message": "Disk full"},
-    requested_effects=[
-        EventEffect(type="notify_user", priority="urgent"),
-    ],
+    priority="urgent",
 )
 ```
 
-| Effect Type | Description |
-|-------------|-------------|
-| `inject_context` | Suggest injecting the event payload into the LLM context |
-| `notify_user` | Suggest notifying the user |
-| `trigger_turn` | Suggest triggering an LLM turn |
-
-Priority levels: `low`, `normal` (default), `high`, `urgent`.
+Priority levels: `low`, `normal` (default when omitted), `high`, `urgent`.
 
 ### Subscription Registry
 
@@ -152,9 +143,10 @@ registry = SubscriptionRegistry()
 store = RetainedValueStore()
 
 topics = [
-    EventTopicDescriptor(pattern="build/+", description="Build events"),
+    EventTopicDescriptor(pattern="build/+", kind="content", description="Build events"),
     EventTopicDescriptor(
         pattern="config/current",
+        kind="content",
         description="Current config",
         retained=True,
     ),
@@ -199,25 +191,27 @@ server.request_handlers[EventListRequest] = handle_list
 
 ## Client-Side
 
-### Session ID
+### Session ID / Agent ID
 
-After initialization, `session.session_id` returns the server-assigned session ID (`str | None`), sourced from `InitializeResult._meta["session_id"]`. This is useful for constructing session-scoped topic patterns:
+After initialization, `session.session_id` returns the server-assigned session ID (`str | None`), sourced from `InitializeResult._meta["session_id"]`. Applications may use this value as their `{agent_id}` when subscribing to agent-scoped topic patterns:
 
 ```python
-topic = f"app/sessions/{session.session_id}/messages"
+topic = f"agents/{session.session_id}/messages"
 await session.subscribe_events([topic])
 ```
 
-Session-scoped topics work for any per-session delivery pattern:
+Agent-scoped topics work for any per-agent delivery pattern:
 
 ```python
-# Non-messaging examples of session-scoped topics:
-build_topic = f"app/sessions/{session.session_id}/builds"
-task_topic = f"app/sessions/{session.session_id}/tasks"
-alerts_topic = f"app/sessions/{session.session_id}/alerts"
+# Non-messaging examples of agent-scoped topics:
+build_topic = f"agents/{session.session_id}/builds"
+task_topic = f"agents/{session.session_id}/tasks"
+alerts_topic = f"agents/{session.session_id}/alerts"
 ```
 
 Returns `None` if the server does not provide a session ID in `_meta`.
+Note: `{agent_id}` is an application-level identity distinct from the MCP
+transport session; see MCP Events Spec v2.
 
 ### Subscribing to Events
 
@@ -314,7 +308,7 @@ from mcp.types import (
 import mcp.types as types
 
 registry = SubscriptionRegistry()
-descriptors = [EventTopicDescriptor(pattern="chat/+", description="Chat messages")]
+descriptors = [EventTopicDescriptor(pattern="chat/+", kind="content", description="Chat messages")]
 
 
 def create_server() -> Server:
@@ -413,10 +407,9 @@ anyio.run(main)
 
 | Type | Description |
 |------|-------------|
-| `EventParams` | Notification payload: topic, eventId, payload, timestamp, effects |
+| `EventParams` | Notification payload: topic, eventId, payload, priority, source, expiresAt, retained |
 | `EventEmitNotification` | Server-to-client notification wrapping `EventParams` |
-| `EventEffect` | Advisory effect hint (type + priority) |
-| `EventTopicDescriptor` | Describes a topic the server can publish to |
+| `EventTopicDescriptor` | Describes a topic the server can publish to (kind, description, suggestedHandle, retained, schema) |
 | `EventsCapability` | Server capability declaration for events |
 | `EventSubscribeParams` | Client request parameters for subscribing |
 | `EventSubscribeResult` | Subscribe response: subscribed, rejected, retained |

@@ -527,18 +527,23 @@ class ServerCapabilities(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-class EventEffect(BaseModel):
-    """Advisory hint about how the client should handle an event."""
-
-    type: Literal["inject_context", "notify_user", "trigger_turn"]
-    priority: Literal["low", "normal", "high", "urgent"] = "normal"
-
-
 class EventTopicDescriptor(BaseModel):
     """Describes a topic the server can publish to."""
 
     pattern: str
+    """Topic pattern, e.g. ``agents/{agent_id}/messages``. The ``{agent_id}``
+    placeholder is a client-side concept; servers receive fully resolved
+    topic strings after the client substitutes its own agent IDs."""
+
+    kind: Literal["content", "signal"]
+    """REQUIRED. ``content`` means payloads are suitable for LLM context
+    injection. ``signal`` means machine-only events (ignored by LLMs)."""
+
     description: str | None = None
+    suggestedHandle: Literal["drop", "silent", "notify", "ask", "inject", "interrupt"] | None = None
+    """Advisory hint for how a client SHOULD handle events on this topic.
+    Clients remain free to override based on their own configuration."""
+
     retained: bool = False
     schema_: dict[str, Any] | None = Field(None, alias="schema")
 
@@ -1452,29 +1457,22 @@ class LoggingMessageNotification(Notification[LoggingMessageNotificationParams, 
 
 
 class EventParams(NotificationParams):
-    """Parameters for events/emit notification."""
+    """Parameters for events/emit notification.
+
+    Wire format is camelCase per JSON-RPC convention (see MCP Events Spec v2).
+    """
 
     topic: str
     eventId: str
-    payload: Any
-    timestamp: str | None = None
+    payload: Any = None
+    priority: Literal["urgent", "high", "normal", "low"] | None = None
     retained: bool = False
     source: str | None = None
-    correlationId: str | None = None
-    requestedEffects: list[EventEffect] | None = None
     expiresAt: str | None = None
 
     @property
     def event_id(self) -> str:
         return self.eventId
-
-    @property
-    def correlation_id(self) -> str | None:
-        return self.correlationId
-
-    @property
-    def requested_effects(self) -> list[EventEffect] | None:
-        return self.requestedEffects
 
     @property
     def expires_at(self) -> str | None:
@@ -1508,12 +1506,17 @@ class RejectedTopic(BaseModel):
 
 
 class RetainedEvent(BaseModel):
-    """A retained event delivered on subscribe."""
+    """A retained event delivered on subscribe.
+
+    Aligned with MCP Events Spec v2: no ``timestamp`` field; ``retained``
+    flag defaults to ``False`` (set to ``True`` when replaying a retained
+    event to a new subscriber).
+    """
 
     topic: str
     eventId: str
-    timestamp: str | None = None
     payload: Any
+    retained: bool = False
 
     @property
     def event_id(self) -> str:

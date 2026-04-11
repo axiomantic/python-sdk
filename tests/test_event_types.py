@@ -21,7 +21,6 @@ from mcp.shared.message import SessionMessage
 from mcp.shared.session import RequestResponder
 from mcp.types import (
     ClientRequest,
-    EventEffect,
     EventEmitNotification,
     EventListRequest,
     EventListResult,
@@ -43,36 +42,38 @@ from mcp.types import (
 )
 
 
-class TestEventEffect:
-    def test_basic(self):
-        e = EventEffect(type="inject_context", priority="high")
-        assert e.type == "inject_context"
-        assert e.priority == "high"
-
-    def test_default_priority(self):
-        e = EventEffect(type="notify_user")
-        assert e.priority == "normal"
-
-    def test_roundtrip(self):
-        e = EventEffect(type="trigger_turn", priority="urgent")
-        data = e.model_dump(by_alias=True)
-        e2 = EventEffect.model_validate(data)
-        assert e2.type == e.type
-        assert e2.priority == e.priority
-
-
 class TestEventTopicDescriptor:
     def test_basic(self):
-        d = EventTopicDescriptor(pattern="foo/bar", description="A topic", retained=True, schema=None)
+        d = EventTopicDescriptor(
+            pattern="foo/bar",
+            kind="content",
+            description="A topic",
+            retained=True,
+            schema=None,
+        )
         assert d.pattern == "foo/bar"
+        assert d.kind == "content"
         assert d.description == "A topic"
         assert d.retained is True
+        assert d.suggestedHandle is None
 
     def test_schema_alias(self):
-        d = EventTopicDescriptor(pattern="x", schema={"type": "object"})
+        d = EventTopicDescriptor(pattern="x", kind="signal", schema={"type": "object"})
         data = d.model_dump(by_alias=True)
         assert data["schema"] == {"type": "object"}
         assert "schema_" not in data
+        assert data["kind"] == "signal"
+
+    def test_suggested_handle(self):
+        d = EventTopicDescriptor(
+            pattern="alerts/#",
+            kind="content",
+            description="Alerts",
+            suggestedHandle="notify",
+        )
+        assert d.suggestedHandle == "notify"
+        data = d.model_dump(by_alias=True, exclude_none=True)
+        assert data["suggestedHandle"] == "notify"
 
 
 class TestEventsCapability:
@@ -84,12 +85,19 @@ class TestEventsCapability:
     def test_with_topics(self):
         c = EventsCapability(
             topics=[
-                EventTopicDescriptor(pattern="a/b", description="Alpha-bravo", retained=True, schema=None),
+                EventTopicDescriptor(
+                    pattern="a/b",
+                    kind="content",
+                    description="Alpha-bravo",
+                    retained=True,
+                    schema=None,
+                ),
             ],
             instructions="Subscribe to a/b for updates",
         )
         assert len(c.topics) == 1
         assert c.topics[0].pattern == "a/b"
+        assert c.topics[0].kind == "content"
         assert c.topics[0].description == "Alpha-bravo"
         assert c.topics[0].retained is True
         assert c.instructions == "Subscribe to a/b for updates"
@@ -130,26 +138,38 @@ class TestEventParams:
 
     def test_all_fields(self):
         p = EventParams(
-            topic="spellbook/sessions/42/messages",
+            topic="agents/worker-42/messages",
             eventId="01JXYZ",
             payload={"text": "hello"},
-            timestamp="2026-04-07T12:00:00Z",
+            priority="high",
             retained=True,
-            source="spellbook",
-            correlationId="corr-1",
-            requestedEffects=[EventEffect(type="inject_context")],
+            source="spellbook/messaging",
             expiresAt="2026-04-08T12:00:00Z",
         )
         data = p.model_dump(by_alias=True, exclude_none=True)
-        assert data["topic"] == "spellbook/sessions/42/messages"
+        assert data["topic"] == "agents/worker-42/messages"
         assert data["eventId"] == "01JXYZ"
         assert data["payload"] == {"text": "hello"}
-        assert data["timestamp"] == "2026-04-07T12:00:00Z"
+        assert data["priority"] == "high"
         assert data["retained"] is True
-        assert data["source"] == "spellbook"
-        assert data["correlationId"] == "corr-1"
-        assert len(data["requestedEffects"]) == 1
+        assert data["source"] == "spellbook/messaging"
         assert data["expiresAt"] == "2026-04-08T12:00:00Z"
+        # v2: no timestamp, correlationId, or requestedEffects fields
+        assert "timestamp" not in data
+        assert "correlationId" not in data
+        assert "requestedEffects" not in data
+
+    def test_priority_defaults_none(self):
+        """priority is optional; when omitted, it stays None."""
+        p = EventParams(topic="t/x", eventId="e1", payload={})
+        assert p.priority is None
+        data = p.model_dump(by_alias=True, exclude_none=True)
+        assert "priority" not in data
+
+    def test_payload_may_be_none(self):
+        """payload is optional for signal events per v2."""
+        p = EventParams(topic="signals/ping", eventId="e1")
+        assert p.payload is None
 
 
 class TestEventEmitNotification:
@@ -242,7 +262,7 @@ class TestResultTypes:
     def test_list_result(self):
         r = EventListResult(
             topics=[
-                EventTopicDescriptor(pattern="x/y", description="desc", schema=None),
+                EventTopicDescriptor(pattern="x/y", kind="content", description="desc", schema=None),
             ]
         )
         data = r.model_dump(by_alias=True, mode="json")
@@ -252,18 +272,6 @@ class TestResultTypes:
         assert len(parsed.topics) == 1
         assert parsed.topics[0].pattern == "x/y"
         assert parsed.topics[0].description == "desc"
-
-
-class TestInvalidEventEffect:
-    def test_invalid_type_rejected(self):
-        """EventEffect with an invalid type literal should be rejected by Pydantic."""
-        with pytest.raises(ValidationError):
-            EventEffect.model_validate({"type": "bogus_effect"})
-
-    def test_invalid_priority_rejected(self):
-        """EventEffect with an invalid priority literal should be rejected."""
-        with pytest.raises(ValidationError):
-            EventEffect.model_validate({"type": "inject_context", "priority": "super_duper"})
 
 
 class TestInvalidEventParams:
@@ -277,10 +285,15 @@ class TestInvalidEventParams:
         with pytest.raises(ValidationError):
             EventParams.model_validate({"topic": "a/b", "payload": "x"})
 
-    def test_missing_payload_rejected(self):
-        """EventParams missing required 'payload' field should fail validation."""
+    def test_missing_payload_allowed(self):
+        """payload is optional in v2 (signal events may omit it)."""
+        p = EventParams.model_validate({"topic": "a/b", "eventId": "e1"})
+        assert p.payload is None
+
+    def test_invalid_priority_rejected(self):
+        """EventParams with an invalid priority literal should be rejected."""
         with pytest.raises(ValidationError):
-            EventParams.model_validate({"topic": "a/b", "eventId": "e1"})
+            EventParams.model_validate({"topic": "a/b", "eventId": "e1", "payload": "x", "priority": "super_duper"})
 
 
 # ---------------------------------------------------------------------------
@@ -685,8 +698,8 @@ async def test_is_expired_with_malformed_date_in_get_matching():
 
 @pytest.mark.anyio
 async def test_emit_event_optional_parameters_roundtrip():
-    """All optional parameters (source, correlation_id, requested_effects, expires_at)
-    should survive the server->client roundtrip."""
+    """All optional parameters (source, priority, expires_at) should
+    survive the server->client roundtrip (MCP Events Spec v2)."""
     server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream[SessionMessage](10)
     client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream[SessionMessage](10)
 
@@ -726,8 +739,7 @@ async def test_emit_event_optional_parameters_roundtrip():
                 payload={"detail": "value"},
                 event_id="full-1",
                 source="test-source",
-                correlation_id="corr-123",
-                requested_effects=[],
+                priority="high",
                 expires_at=future,
             )
 
@@ -739,8 +751,7 @@ async def test_emit_event_optional_parameters_roundtrip():
             assert evt.payload == {"detail": "value"}
             assert evt.event_id == "full-1"
             assert evt.source == "test-source"
-            assert evt.correlation_id == "corr-123"
-            assert evt.requested_effects == []
+            assert evt.priority == "high"
             assert evt.expires_at == future
 
             tg.cancel_scope.cancel()
@@ -748,12 +759,12 @@ async def test_emit_event_optional_parameters_roundtrip():
         pass
 
 
-# -- Finding 2 coverage: timestamp auto-set --
+# -- signal events: payload may be None in v2 --
 
 
 @pytest.mark.anyio
-async def test_emit_event_auto_sets_timestamp():
-    """emit_event should auto-set timestamp when not provided."""
+async def test_emit_event_signal_no_payload():
+    """emit_event should accept events with no payload (signal events, v2)."""
     server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream[SessionMessage](10)
     client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream[SessionMessage](10)
 
@@ -786,21 +797,17 @@ async def test_emit_event_auto_sets_timestamp():
 
             client_session.set_event_handler(event_handler)
 
-            before = datetime.now(timezone.utc)
-
             await server_session.emit_event(
-                topic="test/ts",
-                payload="timestamp-test",
-                event_id="ts-1",
+                topic="test/signal",
+                event_id="sig-1",
             )
 
             await anyio.sleep(0.1)
 
             assert len(received_events) == 1
-            assert received_events[0].timestamp is not None
-            ts = datetime.fromisoformat(received_events[0].timestamp)
-            assert ts >= before
-            assert ts <= datetime.now(timezone.utc)
+            assert received_events[0].topic == "test/signal"
+            assert received_events[0].payload is None
+            assert received_events[0].event_id == "sig-1"
 
             tg.cancel_scope.cancel()
     except (anyio.ClosedResourceError, anyio.EndOfStream):  # pragma: no cover

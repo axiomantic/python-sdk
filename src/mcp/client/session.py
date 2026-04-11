@@ -208,9 +208,12 @@ class ClientSession(
 
         # FastMCP servers inject a server-assigned session_id into
         # InitializeResult._meta so clients can synchronously read it after
-        # connect (e.g. to subscribe to session-scoped event topics like
-        # ``sessions/{session_id}/messages``). Non-FastMCP servers typically
-        # omit this, in which case ``self._session_id`` stays ``None``.
+        # connect. The application may use this as its ``{agent_id}`` when
+        # subscribing to agent-scoped topic patterns such as
+        # ``agents/{agent_id}/messages`` (``{agent_id}`` is an application-
+        # level identity, client-substituted; see MCP Events Spec v2).
+        # Non-FastMCP servers typically omit this, in which case
+        # ``self._session_id`` stays ``None``.
         if result.meta is not None:
             meta_session_id = result.meta.get("session_id")
             if isinstance(meta_session_id, str):
@@ -231,8 +234,9 @@ class ClientSession(
     def session_id(self) -> str | None:
         """The server-assigned session ID from InitializeResult._meta, if present.
 
-        This is set by FastMCP servers to enable client-side subscription to
-        session-scoped event topics like ``sessions/{session_id}/messages``.
+        This is set by FastMCP servers. Applications may use it as the
+        ``{agent_id}`` when subscribing to agent-scoped topic patterns such
+        as ``agents/{agent_id}/messages`` (see MCP Events Spec v2).
         Returns None if the server did not provide a session_id (e.g.,
         non-FastMCP server).
         """

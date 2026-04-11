@@ -37,8 +37,14 @@ from mcp.types import (
 _registry = SubscriptionRegistry()
 _retained_store = RetainedValueStore()
 _topic_descriptors: list[EventTopicDescriptor] = [
-    EventTopicDescriptor(pattern="test/+", description="Test topic", schema=None),
-    EventTopicDescriptor(pattern="retained/value", description="Retained", retained=True, schema=None),
+    EventTopicDescriptor(pattern="test/+", kind="content", description="Test topic", schema=None),
+    EventTopicDescriptor(
+        pattern="retained/value",
+        kind="content",
+        description="Retained",
+        retained=True,
+        schema=None,
+    ),
 ]
 
 
@@ -184,14 +190,11 @@ async def test_emit_event_received_by_client():
             sub_result = await client_session.subscribe_events(["test/+"])
             assert len(sub_result.subscribed) == 1
 
-            # Server emits with an explicit timestamp, exercising the
-            # branch where emit_event does NOT auto-generate one.
-            explicit_ts = "2025-01-01T00:00:00+00:00"
+            # Server emits a basic event.
             await server_session.emit_event(
                 topic="test/hello",
                 payload={"message": "world"},
                 event_id="evt-1",
-                timestamp=explicit_ts,
             )
 
             # Give the notification time to propagate
@@ -201,7 +204,6 @@ async def test_emit_event_received_by_client():
             assert received_events[0].topic == "test/hello"
             assert received_events[0].payload == {"message": "world"}
             assert received_events[0].event_id == "evt-1"
-            assert received_events[0].timestamp == explicit_ts
 
             tg.cancel_scope.cancel()
     except (anyio.ClosedResourceError, anyio.EndOfStream):  # pragma: no cover
