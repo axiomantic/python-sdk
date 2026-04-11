@@ -768,3 +768,110 @@ async def test_client_tool_call_with_meta(meta: dict[str, Any] | None):
         await session.initialize()
 
         await session.call_tool(name=mocked_tool.name, arguments={"foo": "bar"}, meta=meta)
+
+
+@pytest.mark.anyio
+async def test_session_id_extracted_from_meta():
+    """session_id is set when InitializeResult._meta contains a string session_id."""
+    client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream[SessionMessage](1)
+    server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream[SessionMessage](1)
+
+    async def mock_server():
+        session_message = await client_to_server_receive.receive()
+        jsonrpc_request = session_message.message
+        assert isinstance(jsonrpc_request.root, JSONRPCRequest)
+
+        result = ServerResult(
+            InitializeResult(
+                protocolVersion=LATEST_PROTOCOL_VERSION,
+                capabilities=ServerCapabilities(),
+                serverInfo=Implementation(name="mock-server", version="0.1.0"),
+            )
+        )
+        result_dict = result.model_dump(by_alias=True, mode="json", exclude_none=True)
+        # Inject session_id into _meta as a FastMCP server would
+        result_dict["_meta"] = {"session_id": "test-session-abc"}
+
+        async with server_to_client_send:
+            await server_to_client_send.send(
+                SessionMessage(
+                    JSONRPCMessage(
+                        JSONRPCResponse(
+                            jsonrpc="2.0",
+                            id=jsonrpc_request.root.id,
+                            result=result_dict,
+                        )
+                    )
+                )
+            )
+            await client_to_server_receive.receive()
+
+    async with (
+        ClientSession(
+            server_to_client_receive,
+            client_to_server_send,
+        ) as session,
+        anyio.create_task_group() as tg,
+        client_to_server_send,
+        client_to_server_receive,
+        server_to_client_send,
+        server_to_client_receive,
+    ):
+        assert session.session_id is None
+        tg.start_soon(mock_server)
+        await session.initialize()
+
+    assert session.session_id == "test-session-abc"
+
+
+@pytest.mark.anyio
+async def test_session_id_not_set_when_meta_has_non_string_value():
+    """session_id stays None when _meta is present but session_id is not a string."""
+    client_to_server_send, client_to_server_receive = anyio.create_memory_object_stream[SessionMessage](1)
+    server_to_client_send, server_to_client_receive = anyio.create_memory_object_stream[SessionMessage](1)
+
+    async def mock_server():
+        session_message = await client_to_server_receive.receive()
+        jsonrpc_request = session_message.message
+        assert isinstance(jsonrpc_request.root, JSONRPCRequest)
+
+        result = ServerResult(
+            InitializeResult(
+                protocolVersion=LATEST_PROTOCOL_VERSION,
+                capabilities=ServerCapabilities(),
+                serverInfo=Implementation(name="mock-server", version="0.1.0"),
+            )
+        )
+        result_dict = result.model_dump(by_alias=True, mode="json", exclude_none=True)
+        # _meta present but session_id is an integer, not a string
+        result_dict["_meta"] = {"session_id": 42}
+
+        async with server_to_client_send:
+            await server_to_client_send.send(
+                SessionMessage(
+                    JSONRPCMessage(
+                        JSONRPCResponse(
+                            jsonrpc="2.0",
+                            id=jsonrpc_request.root.id,
+                            result=result_dict,
+                        )
+                    )
+                )
+            )
+            await client_to_server_receive.receive()
+
+    async with (
+        ClientSession(
+            server_to_client_receive,
+            client_to_server_send,
+        ) as session,
+        anyio.create_task_group() as tg,
+        client_to_server_send,
+        client_to_server_receive,
+        server_to_client_send,
+        server_to_client_receive,
+    ):
+        tg.start_soon(mock_server)
+        await session.initialize()
+
+    assert session.session_id is None

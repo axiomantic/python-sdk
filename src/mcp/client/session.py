@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import timedelta
 from typing import Any, Protocol, overload
 
@@ -13,6 +14,7 @@ from mcp.client.experimental.task_handlers import ExperimentalTaskHandlers
 from mcp.shared.context import RequestContext
 from mcp.shared.message import SessionMessage
 from mcp.shared.session import BaseSession, ProgressFnT, RequestResponder
+from mcp.shared.topic_patterns import pattern_to_regex
 from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
 
 DEFAULT_CLIENT_INFO = types.Implementation(name="mcp", version="0.1.0")
@@ -40,6 +42,10 @@ class ListRootsFnT(Protocol):
     async def __call__(
         self, context: RequestContext["ClientSession", Any]
     ) -> types.ListRootsResult | types.ErrorData: ...  # pragma: no branch
+
+
+class EventHandlerFnT(Protocol):
+    async def __call__(self, params: types.EventParams) -> None: ...  # pragma: no branch
 
 
 class LoggingFnT(Protocol):
@@ -140,7 +146,15 @@ class ClientSession(
         self._message_handler = message_handler or _default_message_handler
         self._tool_output_schemas: dict[str, dict[str, Any] | None] = {}
         self._server_capabilities: types.ServerCapabilities | None = None
+        self._session_id: str | None = None
         self._experimental_features: ExperimentalClientFeatures | None = None
+        self._event_handler: EventHandlerFnT | None = None
+        self._event_topic_filter: str | None = None
+        self._event_topic_filter_regex: re.Pattern[str] | None = None
+        self._subscribed_patterns: set[str] = set()
+        # Cache compiled regexes for subscription patterns to avoid
+        # recompiling on every incoming event.
+        self._subscription_regex_cache: dict[str, re.Pattern[str]] = {}
 
         # Experimental: Task handlers (use defaults if not provided)
         self._task_handlers = experimental_task_handlers or ExperimentalTaskHandlers()
@@ -192,6 +206,19 @@ class ClientSession(
 
         self._server_capabilities = result.capabilities
 
+        # FastMCP servers inject a server-assigned session_id into
+        # InitializeResult._meta so clients can synchronously read it after
+        # connect. The application may use this as its ``{agent_id}`` when
+        # subscribing to agent-scoped topic patterns such as
+        # ``agents/{agent_id}/messages`` (``{agent_id}`` is an application-
+        # level identity, client-substituted; see MCP Events Spec v2).
+        # Non-FastMCP servers typically omit this, in which case
+        # ``self._session_id`` stays ``None``.
+        if result.meta is not None:
+            meta_session_id = result.meta.get("session_id")
+            if isinstance(meta_session_id, str):
+                self._session_id = meta_session_id
+
         await self.send_notification(types.ClientNotification(types.InitializedNotification()))
 
         return result
@@ -202,6 +229,18 @@ class ClientSession(
         Returns None if the session has not been initialized yet.
         """
         return self._server_capabilities
+
+    @property
+    def session_id(self) -> str | None:
+        """The server-assigned session ID from InitializeResult._meta, if present.
+
+        This is set by FastMCP servers. Applications may use it as the
+        ``{agent_id}`` when subscribing to agent-scoped topic patterns such
+        as ``agents/{agent_id}/messages`` (see MCP Events Spec v2).
+        Returns None if the server did not provide a session_id (e.g.,
+        non-FastMCP server).
+        """
+        return self._session_id
 
     @property
     def experimental(self) -> ExperimentalClientFeatures:
@@ -216,6 +255,114 @@ class ClientSession(
         if self._experimental_features is None:
             self._experimental_features = ExperimentalClientFeatures(self)
         return self._experimental_features
+
+    # ----- Event methods -----
+
+    async def subscribe_events(self, topics: list[str]) -> types.EventSubscribeResult:
+        """Send an events/subscribe request."""
+        result = await self.send_request(
+            types.ClientRequest(
+                types.EventSubscribeRequest(
+                    params=types.EventSubscribeParams(topics=topics),
+                )
+            ),
+            types.EventSubscribeResult,
+        )
+        for sub in result.subscribed:
+            self._subscribed_patterns.add(sub.pattern)
+            if sub.pattern not in self._subscription_regex_cache:
+                self._subscription_regex_cache[sub.pattern] = pattern_to_regex(sub.pattern)
+        return result
+
+    async def unsubscribe_events(self, topics: list[str]) -> types.EventUnsubscribeResult:
+        """Send an events/unsubscribe request."""
+        result = await self.send_request(
+            types.ClientRequest(
+                types.EventUnsubscribeRequest(
+                    params=types.EventUnsubscribeParams(topics=topics),
+                )
+            ),
+            types.EventUnsubscribeResult,
+        )
+        for pattern in result.unsubscribed:
+            self._subscribed_patterns.discard(pattern)
+            self._subscription_regex_cache.pop(pattern, None)
+        return result
+
+    async def list_events(self) -> types.EventListResult:
+        """Send an events/list request."""
+        return await self.send_request(
+            types.ClientRequest(types.EventListRequest()),
+            types.EventListResult,
+        )
+
+    def set_event_handler(
+        self,
+        handler: EventHandlerFnT,
+        *,
+        topic_filter: str | None = None,
+    ) -> None:
+        """Register a callback for incoming event notifications.
+
+        If *topic_filter* is provided, it is compiled once here and the
+        cached regex is reused for every incoming event. The filter uses
+        the same MQTT-style wildcard syntax as subscription patterns
+        (``+`` for a single segment, ``#`` as a trailing multi-segment
+        wildcard).
+        """
+        self._event_handler = handler
+        self._event_topic_filter = topic_filter
+        self._event_topic_filter_regex = pattern_to_regex(topic_filter) if topic_filter is not None else None
+
+    def on_event(self, topic_filter: str | None = None):
+        """Decorator for registering an event handler."""
+
+        def decorator(fn: EventHandlerFnT) -> EventHandlerFnT:
+            self.set_event_handler(fn, topic_filter=topic_filter)
+            return fn
+
+        return decorator
+
+    def _topic_matches_subscriptions(self, topic: str) -> bool:
+        """Check if *topic* matches any of our subscribed patterns.
+
+        Compiled regexes are cached per subscription pattern so incoming
+        events do not pay a recompile cost on every match attempt.
+        """
+        for pattern in self._subscribed_patterns:
+            regex = self._subscription_regex_cache.get(pattern)
+            if regex is None:
+                regex = pattern_to_regex(pattern)
+                self._subscription_regex_cache[pattern] = regex
+            if regex.match(topic):
+                return True
+        return False
+
+    async def _handle_event(self, params: types.EventParams) -> None:
+        """Dispatch an incoming event to the registered handler.
+
+        Filtering order:
+
+        1. If no handler is registered, drop the event.
+        2. If the client has any active subscriptions, the topic must
+           match at least one of them. Events for unsubscribed topics
+           are dropped. (A client with zero subscriptions accepts any
+           topic the server chooses to deliver; this is the "pass
+           through" fallback documented in ``docs/events.md``.)
+        3. If an additional ``topic_filter`` was provided to
+           ``set_event_handler``, the topic must also match that
+           filter.
+        """
+        if self._event_handler is None:
+            return
+
+        if self._subscribed_patterns and not self._topic_matches_subscriptions(params.topic):
+            return
+
+        if self._event_topic_filter_regex is not None and not self._event_topic_filter_regex.match(params.topic):
+            return
+
+        await self._event_handler(params)
 
     async def send_ping(self) -> types.EmptyResult:
         """Send a ping request."""
@@ -611,5 +758,7 @@ class ClientSession(
                 # Clients MAY use this to retry requests or update UI
                 # The notification contains the elicitationId of the completed elicitation
                 pass
+            case types.EventEmitNotification(params=params):
+                await self._handle_event(params)
             case _:
                 pass

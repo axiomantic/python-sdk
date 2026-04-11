@@ -1,0 +1,423 @@
+# Events
+
+Events enable server-to-client push notifications over named topics. Clients subscribe to topic patterns, and servers emit events that are delivered to all matching subscribers. Events support MQTT-style wildcard patterns, retained values, and advisory effect hints.
+
+## When to Use Events
+
+Events are designed for:
+
+- Real-time state changes (e.g., a build finished, a file changed)
+- Progress or status broadcasts that multiple clients may care about
+- Lightweight notifications where a full tool call or resource read is unnecessary
+
+If the client needs to _request_ data, use resources or tools instead. Events are for server-initiated pushes.
+
+## Topic Patterns
+
+Topics are `/`-separated strings with a maximum depth of 8 segments. Clients subscribe using MQTT-style wildcard patterns:
+
+| Pattern | Matches | Does Not Match |
+|---------|---------|----------------|
+| `build/status` | `build/status` | `build/status/detail` |
+| `build/+` | `build/status`, `build/log` | `build/status/detail` |
+| `build/#` | `build`, `build/status`, `build/status/detail` | `deploy/status` |
+| `+/status` | `build/status`, `deploy/status` | `build/sub/status` |
+| `#` | Everything | (matches all topics) |
+
+- `+` matches exactly one segment
+- `#` matches zero or more trailing segments (must be the last segment)
+
+### Agent-Scoped Topics
+
+Servers may use an `{agent_id}` placeholder in topic patterns to scope topics to individual application-level agents (e.g., `agents/{agent_id}/messages`). `{agent_id}` is a client-side concept: the server receives fully resolved topic strings after the client substitutes its own agent IDs. When a topic contains `{agent_id}`, the server enforces that subscribers can only substitute their own agent ID -- wildcards and other agent IDs are rejected. Agents use `{agent_id}` to receive topics scoped to themselves -- useful for targeted notifications, status updates, task assignments, or any application-level filtering that should be per-agent. This convention is normative per MCP Events Spec v2; `{agent_id}` is distinct from the MCP transport session ID, which is NOT exposed in topic patterns.
+
+## Server-Side
+
+### Declaring Event Topics
+
+Servers declare available topics through `EventTopicDescriptor` entries on the `EventsCapability`. The SDK auto-declares the `events` capability when an `EventSubscribeRequest` handler is registered.
+
+### Emitting Events
+
+Use `ServerSession.emit_event()` to push an event to the connected client:
+
+```python
+await server_session.emit_event(
+    topic="build/status",
+    payload={"project": "myapp", "status": "success"},
+)
+```
+
+`emit_event()` accepts these keyword arguments:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `topic` | `str` | (required) | Topic string to publish on |
+| `payload` | `Any \| None` | `None` | Event data (any JSON-serializable value, or `None` for signal events) |
+| `event_id` | `str \| None` | auto-generated ULID | Unique event identifier |
+| `priority` | `Literal["urgent","high","normal","low"] \| None` | `None` | Server hint for event urgency; clients default to `"normal"` when absent |
+| `retained` | `bool` | `False` | Whether to treat as a retained value |
+| `source` | `str \| None` | `None` | Opaque source identifier |
+| `expires_at` | `str \| None` | `None` | ISO 8601 expiry for retained values |
+
+### Priority
+
+`priority` is the only server-side hint in MCP Events Spec v2. It declares
+how urgent the event is; the client decides how to handle it (drop, silent,
+notify, ask, inject, interrupt) based on its own configuration and the
+topic's `suggestedHandle`.
+
+```python
+await server_session.emit_event(
+    topic="alert/critical",
+    payload={"message": "Disk full"},
+    priority="urgent",
+)
+```
+
+Priority levels: `low`, `normal` (default when omitted), `high`, `urgent`.
+
+### Subscription Registry
+
+`SubscriptionRegistry` manages which sessions are subscribed to which patterns. It handles wildcard matching and guarantees at-most-once delivery per session per event:
+
+```python
+from mcp.server.events import SubscriptionRegistry
+
+registry = SubscriptionRegistry()
+
+# Track a session's subscription
+await registry.add(session_id, "build/+")
+
+# Find all sessions that should receive an event
+matching_sessions = await registry.match("build/status")
+
+# Clean up on disconnect
+await registry.remove_all(session_id)
+```
+
+### Retained Value Store
+
+`RetainedValueStore` caches the most recent event per topic so new subscribers receive the current state immediately:
+
+```python
+from mcp.server.events import RetainedValueStore
+from mcp.types import RetainedEvent
+
+store = RetainedValueStore()
+
+# Store a retained value
+await store.set(
+    "sensor/temperature",
+    RetainedEvent(topic="sensor/temperature", eventId="evt-1", payload=22.5),
+    expires_at="2025-12-31T23:59:59Z",  # optional expiry
+)
+
+# Retrieve retained values matching a pattern
+retained = await store.get_matching("sensor/+")
+```
+
+Retained values with an `expires_at` in the past are automatically cleaned up on access.
+
+### Handling Subscriptions (Low-Level Server)
+
+Register request handlers for `EventSubscribeRequest`, `EventUnsubscribeRequest`, and `EventListRequest` on the low-level `Server`:
+
+```python
+from mcp.server.lowlevel.server import Server, request_ctx
+from mcp.server.events import SubscriptionRegistry, RetainedValueStore
+from mcp.types import (
+    EventSubscribeRequest,
+    EventSubscribeResult,
+    EventUnsubscribeRequest,
+    EventUnsubscribeResult,
+    EventListRequest,
+    EventListResult,
+    EventTopicDescriptor,
+    RetainedEvent,
+    ServerResult,
+    SubscribedTopic,
+)
+
+registry = SubscriptionRegistry()
+store = RetainedValueStore()
+
+topics = [
+    EventTopicDescriptor(pattern="build/+", kind="content", description="Build events"),
+    EventTopicDescriptor(
+        pattern="config/current",
+        kind="content",
+        description="Current config",
+        retained=True,
+    ),
+]
+
+server = Server("my-server")
+
+
+async def handle_subscribe(req: EventSubscribeRequest):
+    ctx = request_ctx.get()
+    subscribed = []
+    for pattern in req.params.topics:
+        await registry.add(str(ctx.request_id), pattern)
+        subscribed.append(SubscribedTopic(pattern=pattern))
+
+    retained: list[RetainedEvent] = []
+    for pattern in req.params.topics:
+        retained.extend(await store.get_matching(pattern))
+
+    return ServerResult(
+        EventSubscribeResult(subscribed=subscribed, retained=retained)
+    )
+
+
+async def handle_unsubscribe(req: EventUnsubscribeRequest):
+    ctx = request_ctx.get()
+    for pattern in req.params.topics:
+        await registry.remove(str(ctx.request_id), pattern)
+    return ServerResult(
+        EventUnsubscribeResult(unsubscribed=req.params.topics)
+    )
+
+
+async def handle_list(req: EventListRequest):
+    return ServerResult(EventListResult(topics=topics))
+
+
+server.request_handlers[EventSubscribeRequest] = handle_subscribe
+server.request_handlers[EventUnsubscribeRequest] = handle_unsubscribe
+server.request_handlers[EventListRequest] = handle_list
+```
+
+## Client-Side
+
+### Session ID / Agent ID
+
+After initialization, `session.session_id` returns the server-assigned session ID (`str | None`), sourced from `InitializeResult._meta["session_id"]`. Applications may use this value as their `{agent_id}` when subscribing to agent-scoped topic patterns:
+
+```python
+topic = f"agents/{session.session_id}/messages"
+await session.subscribe_events([topic])
+```
+
+Agent-scoped topics work for any per-agent delivery pattern:
+
+```python
+# Non-messaging examples of agent-scoped topics:
+build_topic = f"agents/{session.session_id}/builds"
+task_topic = f"agents/{session.session_id}/tasks"
+alerts_topic = f"agents/{session.session_id}/alerts"
+```
+
+Returns `None` if the server does not provide a session ID in `_meta`.
+Note: `{agent_id}` is an application-level identity distinct from the MCP
+transport session; see MCP Events Spec v2.
+
+### Subscribing to Events
+
+Use `subscribe_events()` to register interest in one or more topic patterns:
+
+```python
+result = await session.subscribe_events(["build/+", "deploy/#"])
+
+for sub in result.subscribed:
+    print(f"Subscribed: {sub.pattern}")
+
+for rej in result.rejected:
+    print(f"Rejected: {rej.pattern} ({rej.reason})")
+
+# Retained values are delivered inline
+for event in result.retained:
+    print(f"Retained: {event.topic} = {event.payload}")
+```
+
+The `EventSubscribeResult` contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `subscribed` | `list[SubscribedTopic]` | Patterns the server accepted |
+| `rejected` | `list[RejectedTopic]` | Patterns the server refused, with reasons |
+| `retained` | `list[RetainedEvent]` | Current retained values for subscribed topics |
+
+### Receiving Events
+
+Register a handler to process incoming events. Two approaches:
+
+**Using `set_event_handler()`:**
+
+```python
+async def on_event(params: EventParams) -> None:
+    print(f"[{params.topic}] {params.payload}")
+
+session.set_event_handler(on_event)
+```
+
+**Using the `@on_event` decorator:**
+
+```python
+@session.on_event(topic_filter="build/+")
+async def on_build_event(params: EventParams) -> None:
+    print(f"Build: {params.payload}")
+```
+
+The optional `topic_filter` applies an additional client-side filter using the same wildcard syntax as subscription patterns. The filter is compiled once when the handler is registered and reused for every incoming event. Events that do not match the filter are silently dropped before reaching the handler.
+
+The client also tracks subscribed patterns internally. Once a client has at least one active subscription, events whose topic does not match any subscribed pattern are dropped before reaching the handler, even if the server sends them. A client that never calls `subscribe_events` has no subscription patterns registered and will pass every event received from the server through to the handler, subject only to the optional `topic_filter`. If you want strict subscription-only delivery, subscribe explicitly.
+
+### Unsubscribing
+
+```python
+result = await session.unsubscribe_events(["build/+"])
+# result.unsubscribed contains the patterns that were removed
+```
+
+### Listing Available Topics
+
+```python
+result = await session.list_events()
+for topic in result.topics:
+    print(f"{topic.pattern}: {topic.description} (retained={topic.retained})")
+```
+
+## Full Example
+
+A complete server and client exchanging events over an in-memory transport:
+
+```python
+import anyio
+from mcp.client.session import ClientSession
+from mcp.server.events import SubscriptionRegistry
+from mcp.server.lowlevel.server import Server, request_ctx
+from mcp.server.lowlevel import NotificationOptions
+from mcp.server.models import InitializationOptions
+from mcp.server.session import ServerSession
+from mcp.shared.message import SessionMessage
+from mcp.shared.session import RequestResponder
+from mcp.types import (
+    EventListRequest,
+    EventListResult,
+    EventParams,
+    EventSubscribeRequest,
+    EventSubscribeResult,
+    EventTopicDescriptor,
+    EventUnsubscribeRequest,
+    EventUnsubscribeResult,
+    ServerResult,
+    SubscribedTopic,
+)
+import mcp.types as types
+
+registry = SubscriptionRegistry()
+descriptors = [EventTopicDescriptor(pattern="chat/+", kind="content", description="Chat messages")]
+
+
+def create_server() -> Server:
+    server = Server("event-demo")
+
+    async def on_subscribe(req: EventSubscribeRequest):
+        ctx = request_ctx.get()
+        subscribed = []
+        for p in req.params.topics:
+            await registry.add("demo", p)
+            subscribed.append(SubscribedTopic(pattern=p))
+        return ServerResult(EventSubscribeResult(subscribed=subscribed))
+
+    async def on_unsubscribe(req: EventUnsubscribeRequest):
+        for p in req.params.topics:
+            await registry.remove("demo", p)
+        return ServerResult(EventUnsubscribeResult(unsubscribed=req.params.topics))
+
+    async def on_list(req: EventListRequest):
+        return ServerResult(EventListResult(topics=descriptors))
+
+    server.request_handlers[EventSubscribeRequest] = on_subscribe
+    server.request_handlers[EventUnsubscribeRequest] = on_unsubscribe
+    server.request_handlers[EventListRequest] = on_list
+    return server
+
+
+async def main():
+    server = create_server()
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage](10)
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage](10)
+
+    received: list[EventParams] = []
+
+    async with (
+        ServerSession(
+            c2s_recv,
+            s2c_send,
+            InitializationOptions(
+                server_name="demo",
+                server_version="0.1.0",
+                capabilities=server.get_capabilities(NotificationOptions(), {}),
+            ),
+        ) as server_session,
+        ClientSession(s2c_recv, c2s_send) as client_session,
+        anyio.create_task_group() as tg,
+    ):
+
+        async def run_server():
+            async for msg in server_session.incoming_messages:
+                if isinstance(msg, RequestResponder):
+                    with msg:
+                        handler = server.request_handlers.get(type(msg.request.root))
+                        if handler:
+                            token = request_ctx.set(
+                                types.RequestContext(
+                                    request_id=msg.request_id,
+                                    meta=msg.request_meta,
+                                    session=server_session,
+                                    lifespan_context={},
+                                )
+                            )
+                            try:
+                                await msg.respond(await handler(msg.request.root))
+                            finally:
+                                request_ctx.reset(token)
+
+        tg.start_soon(run_server)
+        await client_session.initialize()
+
+        # Subscribe and set handler
+        await client_session.subscribe_events(["chat/+"])
+
+        @client_session.on_event()
+        async def handle(params: EventParams) -> None:
+            received.append(params)
+
+        # Server emits an event
+        await server_session.emit_event(
+            topic="chat/general",
+            payload={"user": "alice", "text": "hello"},
+        )
+
+        await anyio.sleep(0.1)
+        print(f"Received {len(received)} event(s)")
+        for ev in received:
+            print(f"  [{ev.topic}] {ev.payload}")
+
+        tg.cancel_scope.cancel()
+
+
+anyio.run(main)
+```
+
+## Types Reference
+
+| Type | Description |
+|------|-------------|
+| `EventParams` | Notification payload: topic, eventId, payload, priority, source, expiresAt, retained |
+| `EventEmitNotification` | Server-to-client notification wrapping `EventParams` |
+| `EventTopicDescriptor` | Describes a topic the server can publish to (kind, description, suggestedHandle, retained, schema) |
+| `EventsCapability` | Server capability declaration for events |
+| `EventSubscribeParams` | Client request parameters for subscribing |
+| `EventSubscribeResult` | Subscribe response: subscribed, rejected, retained |
+| `EventUnsubscribeParams` | Client request parameters for unsubscribing |
+| `EventUnsubscribeResult` | Unsubscribe response: list of removed patterns |
+| `EventListResult` | Response listing available topic descriptors |
+| `SubscribedTopic` | A successfully subscribed pattern |
+| `RejectedTopic` | A rejected pattern with reason |
+| `RetainedEvent` | A cached event delivered on subscribe |
+| `SubscriptionRegistry` | Server-side session-to-pattern registry with wildcard matching |
+| `RetainedValueStore` | Server-side per-topic retained value cache with expiry |

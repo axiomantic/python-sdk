@@ -483,13 +483,15 @@ class TestChildProcessCleanup:
             # Start the parent process
             proc = await _create_platform_compatible_process(sys.executable, ["-c", parent_script])
 
-            # Let child start writing
-            await anyio.sleep(0.5)
+            # Let child start writing (Windows CI with Python 3.10 needs
+            # extra time for the grandchild to import and begin I/O)
+            startup_delay = 2.0 if sys.platform == "win32" else 0.5
+            await anyio.sleep(startup_delay)
 
             # Verify child is writing
             if os.path.exists(marker_file):  # pragma: no cover
                 size1 = os.path.getsize(marker_file)
-                await anyio.sleep(0.3)
+                await anyio.sleep(0.5)
                 size2 = os.path.getsize(marker_file)
                 assert size2 > size1, "Child should be writing"
 

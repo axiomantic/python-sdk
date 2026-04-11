@@ -38,12 +38,13 @@ be instantiated directly by users of the MCP framework.
 """
 
 from enum import Enum
-from typing import Any, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 import anyio
 import anyio.lowlevel
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from pydantic import AnyUrl
+from ulid import ULID
 
 import mcp.types as types
 from mcp.server.experimental.session_features import ExperimentalServerSessionFeatures
@@ -201,6 +202,43 @@ class ServerSession(
             case _:
                 if self._initialization_state != InitializationState.Initialized:  # pragma: no cover
                     raise RuntimeError("Received notification before initialization was complete")
+
+    async def emit_event(
+        self,
+        topic: str,
+        payload: Any = None,
+        *,
+        event_id: str | None = None,
+        priority: Literal["urgent", "high", "normal", "low"] | None = None,
+        retained: bool = False,
+        source: str | None = None,
+        expires_at: str | None = None,
+        related_request_id: types.RequestId | None = None,
+    ) -> None:
+        """Push an event to the client on the given topic.
+
+        Aligned with MCP Events Spec v2: priority is the only server hint;
+        there is no ``correlation_id``/``requested_effects``/``timestamp``.
+        Clients decide handling via their own configuration.
+        """
+        if event_id is None:
+            event_id = str(ULID())
+        await self.send_notification(
+            types.ServerNotification(
+                types.EventEmitNotification(
+                    params=types.EventParams(
+                        topic=topic,
+                        eventId=event_id,
+                        payload=payload,
+                        priority=priority,
+                        retained=retained,
+                        source=source,
+                        expiresAt=expires_at,
+                    ),
+                )
+            ),
+            related_request_id,
+        )
 
     async def send_log_message(
         self,
